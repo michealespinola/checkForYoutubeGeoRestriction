@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A script to automagically check for YouTube geo-restrictions.
 # Author @michealespinola https://github.com/michealespinola/checkForYoutubeGeoRestriction
 # shellcheck source=/dev/null
@@ -28,7 +28,7 @@ translate_codes() {
     printf "* [null]\n"
   else
     while IFS= read -r CODE; do
-      NAME=$(printf "%s\n" "$COUNTRY_MAP" | grep -F "${CODE}|" | cut -d'|' -f2-)
+      NAME=$(printf "%s\n" "$COUNTRY_MAP" | $grep -F "${CODE}|" | cut -d'|' -f2-)
       if [[ -n "$NAME" ]]; then
         printf "* %s - %s\n" "$CODE" "$NAME"
       else
@@ -50,7 +50,16 @@ count_nonempty_lines() {
 }
 
 # check required tools
-for cmd in curl jq; do
+if [[ "$(uname)" =~ ^(Darwin|DragonFly|.*BSD)$ ]]; then
+  sed=gsed
+  grep=ggrep
+else
+  sed=sed
+  grep=grep
+fi
+
+cmds=(jq curl "$sed" "$grep")
+for cmd in "${cmds[@]}"; do
   if ! command -v "$cmd" &>/dev/null; then
     printf "Error: Required command '%s' not found.\n" "$cmd"
     exit 1
@@ -103,17 +112,17 @@ URLS=("$@")
 
 for VIDEO_URL in "${URLS[@]}"; do
   # normalize youtube.com
-  VIDEO_URL="$(printf "%s" "$VIDEO_URL" | sed -E 's#https?://(m\.|music\.|gaming\.|youtube-nocookie\.)?youtube\.com#https://www.youtube.com#')"
+  VIDEO_URL="$(printf "%s" "$VIDEO_URL" | $sed -E 's#https?://(m\.|music\.|gaming\.|youtube-nocookie\.)?youtube\.com#https://www.youtube.com#')"
   # normalize youtu.be
   if [[ "$VIDEO_URL" =~ ^https://youtu\.be/([a-zA-Z0-9_-]+) ]]; then
     ID="${BASH_REMATCH[1]}"
     VIDEO_URL="https://www.youtube.com/watch?v=${ID}"
   else
-    ID="$(printf "%s" "$VIDEO_URL" | sed -E 's#.*v=([^&]+).*#\1#')"
+    ID="$(printf "%s" "$VIDEO_URL" | $sed -E 's#.*v=([^&]+).*#\1#')"
   fi
 
   HTML="$(curl -fsSL "$VIDEO_URL")"
-  JSON="$(printf "%s" "$HTML" | grep -oP 'ytInitialPlayerResponse\s*=\s*\{.*?\};' | sed -e 's/^ytInitialPlayerResponse\s*=\s*//' -e 's/;*$//')"
+  JSON="$(printf "%s" "$HTML" | $grep -oP 'ytInitialPlayerResponse\s*=\s*\{.*?\};' | $sed -e 's/^ytInitialPlayerResponse\s*=\s*//' -e 's/;*$//')"
   if [[ "$SAVE_JSON" -eq 1 ]]; then
     printf '%s' "$JSON" | jq -S . >"${SCRIPT_DIR}/${SCRIPT_BASE}.${ID}.json"
   fi
@@ -138,9 +147,9 @@ for VIDEO_URL in "${URLS[@]}"; do
     SUBREASON="$(printf "%s\n" "$JSON" | jq -r '.playabilityStatus.errorScreen.playerErrorMessageRenderer.subreason.runs? // [] | map(.text) | join("")')"
     [[ -n "$SUBREASON" ]] && REASON="${REASON} - ${SUBREASON}"
     ALLOWED_CODES="$(printf "%s\n" "$JSON" | jq -r '.microformat.playerMicroformatRenderer.availableCountries? // empty | .[]' | sort -u)"
-    #ALLOWED_COUNT="$(printf "%s\n" "$ALLOWED_CODES" | sed '/^$/d' | wc -l | tr -d ' ')"
+    #ALLOWED_COUNT="$(printf "%s\n" "$ALLOWED_CODES" | $sed '/^$/d' | wc -l | tr -d ' ')"
     BLOCKED_CODES="$(comm -23 <(printf "%s\n" "$ALL_ISO_CODES") <(printf "%s\n" "$ALLOWED_CODES"))"
-    #BLOCKED_COUNT="$(printf "%s\n" "$BLOCKED_CODES" | sed '/^$/d' | wc -l | tr -d ' ')"
+    #BLOCKED_COUNT="$(printf "%s\n" "$BLOCKED_CODES" | $sed '/^$/d' | wc -l | tr -d ' ')"
     # Existing:
     # ALLOWED_COUNT=$(printf "%s" "$ALLOWED_CODES" | wc -l)
     # BLOCKED_COUNT=$(printf "%s" "$BLOCKED_CODES" | wc -l)
