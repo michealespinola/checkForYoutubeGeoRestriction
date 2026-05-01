@@ -17,7 +17,8 @@ Options:
 ### Utilization and example output
 
 ```
-# bash /volume1/homes/admin/scripts/bash/checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"                                             
+# bash checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"
+                                          
 CHECK FOR YOUTUBE GEORESTRICTION v2.0.0
 
    URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
