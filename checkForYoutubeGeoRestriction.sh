@@ -19,18 +19,53 @@ DEFAULT_ISO_URL="https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with
 # Default scrape source (used when generating ISO JSON without --iso-url)
 IBAN_COUNTRY_CODES_URL="https://www.iban.com/country-codes"
 
-JSON_NAME="iso-3166-1-slim-2.json"
+JSON_NAME="geo-cache.json"
+LEGACY_JSON_NAME="iso-3166-1-slim-2.json"
 
 usage() {
-  printf "%s\n" "Usage: $0 [options] \"https://www.youtube.com/watch?v=...\" [more-urls...]"
+  printf "%s\n" "Usage: $0 [options] [\"https://www.youtube.com/watch?v=...\"]"
   printf "%s\n" ""
   printf "%s\n" "Options:"
   printf "%s\n" "  -b                 Show inferred blocked countries"
-  printf "%s\n" "  -c                 Show chart output"
   printf "%s\n" "  -j                 Save extracted ytInitialPlayerResponse JSON"
   printf "%s\n" "  --iso-url URL      Download ISO JSON from URL (shim for manual source)"
-  printf "%s\n" "  --refresh-iso      Force rebuild/download of ISO JSON cache"
+  printf "%s\n" "  --refresh-iso      Force rebuild/download of geo cache country list"
   printf "%s\n" "  -h, --help         Show this help"
+}
+
+get_term_cols() {                                                                                 # FUNCTION TO GET TERMINAL COLUMN WIDTH
+  local cols
+  cols=$(stty size 2>/dev/null | awk '{print $2}')                                                # 1) stty (works when stdout is a tty)
+  if [[ $cols =~ ^[0-9]+$ ]] && (( cols > 0 )); then
+    printf '%s\n' "$cols"
+    return
+  fi
+  if [[ ${COLUMNS:-} =~ ^[0-9]+$ ]] && (( COLUMNS > 0 )); then                                    # 2) COLUMNS env var (sometimes set by shells)
+    printf '%s\n' "$COLUMNS"
+    return
+  fi
+  printf '80\n'                                                                                   # 3) Standard fallback
+}
+
+print_wrap() { # <resume_col> <right_margin> <left_text> <right_text>                             # FUNCTION TO PRINT WRAPPED HELP LINE
+  local resume_col=$1
+  local right_margin=$2
+  local cols wrap wrapped text_col
+
+  cols=$(get_term_cols)
+  text_col=$((resume_col + 1))
+  wrap=$((cols - right_margin - text_col))
+  ((wrap < 20)) && wrap=20                                                                        # Sanity floor
+
+  wrapped=$(printf '%s\n' "$4" | fold -s -w "$wrap")
+
+  printf '%'"$resume_col"'s %s\n' \
+    "$3" \
+    "$(printf '%s\n' "$wrapped" | sed -n '1p')" >&2                                               # First line: left column + first wrapped line
+
+  printf '%s\n' "$wrapped" |                                                                      # Continuation lines:
+    sed -n '2,$p' |                                                                               # Right margin wrap
+    awk -v col="$text_col" '{ printf "%*s%s\n", col, "", $0 }' >&2                                # Indent to resume column
 }
 
 if [[ $# -lt 1 ]]; then
@@ -41,9 +76,7 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPT_BASE="$(basename -- "${BASH_SOURCE[0]%.*}")"
 JSON_PATH="${SCRIPT_DIR}/${JSON_NAME}"
-
-
-
+LEGACY_JSON_PATH="${SCRIPT_DIR}/${LEGACY_JSON_NAME}"
 
 # Translate ISO country codes to names using COUNTRY_MAP
 translate_codes() {
@@ -194,37 +227,191 @@ build_iso_json_from_iban() {
     '
 }
 
-# Get the source/public IP country and format it for STATUS output.
-# Empty output is intentional on lookup failure so STATUS output still works offline.
-get_origin_country_suffix() {
-  local CODE=""
-  local NAME=""
+# Write ISO country data into the unified geo cache, preserving existing origin data.
+write_country_cache_atomic() {
+  local dest="$1"
+  local provider="$2"
+  local source_url="$3"
+  local tmp="${dest}.tmp.$$"
+  local origin="{}"
+  local checked_at=""
+  local checked_epoch=""
 
-  CODE="$(curl -fsSL --max-time 3 https://ipapi.co/country/ 2>/dev/null || true)"
-  CODE="$(printf '%s' "$CODE" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  checked_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  checked_epoch="$(date -u '+%s')"
 
-  if [[ ! "$CODE" =~ ^[A-Z][A-Z]$ ]]; then
-    return 0
+  if [[ -f "$dest" ]]; then
+    origin="$(jq -c 'if type == "object" then (.origin // {}) else {} end' "$dest" 2>/dev/null || printf '{}')"
   fi
 
-  NAME="${COUNTRY_NAME_BY_CODE[$CODE]-}"
-  if [[ -n "$NAME" ]]; then
-    printf ' (%s - %s)' "$CODE" "$NAME"
+  if jq \
+    --arg checked_at "$checked_at" \
+    --arg checked_epoch "$checked_epoch" \
+    --arg provider "$provider" \
+    --arg source_url "$source_url" \
+    --argjson origin "$origin" '
+      (
+        if type == "array" then .
+        elif type == "object" and (.countries | type == "array") then .countries
+        else error("expected ISO country array or geo cache object with countries array")
+        end
+      ) as $countries
+      | {
+          cache: {
+            schema: 2,
+            countries_updated_at: $checked_at
+          },
+          origin: $origin,
+          countries_meta: {
+            provider: $provider,
+            source_url: $source_url,
+            checked_at: $checked_at,
+            checked_epoch: ($checked_epoch | tonumber),
+            count: ($countries | length)
+          },
+          countries: $countries
+        }
+    ' >"$tmp"; then
+    mv -f -- "$tmp" "$dest"
   else
-    printf ' (%s - [Unknown])' "$CODE"
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+get_cached_origin_ip() {
+  jq -r 'if type == "object" then (.origin.external_ip // "") else "" end' "$JSON_PATH" 2>/dev/null
+}
+
+get_cached_origin_country_code() {
+  jq -r 'if type == "object" then (.origin.country_code // "") else "" end' "$JSON_PATH" 2>/dev/null
+}
+
+get_cached_origin_lookup_failed_epoch() {
+  jq -r 'if type == "object" then (.origin.lookup_failed_epoch // "0") else "0" end' "$JSON_PATH" 2>/dev/null
+}
+
+update_origin_cache() {
+  local external_ip="$1"
+  local country_code="$2"
+  local result="$3"
+  local checked_at=""
+  local checked_epoch=""
+  local tmp="${JSON_PATH}.tmp.$$"
+
+  checked_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  checked_epoch="$(date -u '+%s')"
+
+  if jq \
+    --arg external_ip "$external_ip" \
+    --arg country_code "$country_code" \
+    --arg ip_provider "api.ipify.org" \
+    --arg country_provider "ipapi.co" \
+    --arg checked_at "$checked_at" \
+    --arg checked_epoch "$checked_epoch" \
+    --arg result "$result" '
+      if type == "array" then
+        {
+          cache: {
+            schema: 2
+          },
+          origin: {},
+          countries: .
+        }
+      else
+        .
+      end
+      | .cache.schema = 2
+      | .origin.external_ip = $external_ip
+      | .origin.country_code = $country_code
+      | .origin.ip_provider = $ip_provider
+      | .origin.country_provider = $country_provider
+      | .origin.checked_at = $checked_at
+      | .origin.checked_epoch = ($checked_epoch | tonumber)
+      | .origin.result = $result
+      | if $result == "failure" then
+          .origin.lookup_failed_at = $checked_at
+          | .origin.lookup_failed_epoch = ($checked_epoch | tonumber)
+        else
+          del(.origin.lookup_failed_at, .origin.lookup_failed_epoch)
+        end
+    ' "$JSON_PATH" >"$tmp"; then
+    mv -f -- "$tmp" "$JSON_PATH"
+  else
+    rm -f -- "$tmp"
+    return 1
   fi
 }
 
-# Write atomically: generate to temp then mv.
-write_file_atomic() {
-  local dest="$1"
-  local tmp="${dest}.tmp.$$"
-  cat >"$tmp"
-  mv -f -- "$tmp" "$dest"
+get_current_external_ip() {
+  local ip=""
+
+  ip="$(curl -fsSL --connect-timeout 5 --max-time 10 https://api.ipify.org/ 2>/dev/null || true)"
+  ip="$(printf '%s' "$ip" | tr -d '[:space:]')"
+
+  if [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+    printf '%s' "$ip"
+  fi
+}
+
+lookup_origin_country_code() {
+  local code=""
+
+  code="$(curl -fsSL --connect-timeout 5 --max-time 10 https://ipapi.co/country/ 2>/dev/null || true)"
+  code="$(printf '%s' "$code" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+
+  if [[ "$code" =~ ^[A-Z][A-Z]$ ]]; then
+    printf '%s' "$code"
+  fi
+}
+
+# Get the source/public IP country.
+# Uses the cached country code when the cached external IP still matches.
+get_origin_country() {
+  local current_ip=""
+  local cached_ip=""
+  local code=""
+  local name=""
+  local failed_epoch="0"
+  local now_epoch=""
+  local failure_cooldown=$((6 * 60 * 60))
+
+  current_ip="$(get_current_external_ip)"
+  cached_ip="$(get_cached_origin_ip)"
+  code="$(get_cached_origin_country_code)"
+  code="$(printf '%s' "$code" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+
+  if [[ -z "$current_ip" ]]; then
+    if [[ ! "$code" =~ ^[A-Z][A-Z]$ ]]; then
+      return 0
+    fi
+  elif [[ "$current_ip" != "$cached_ip" || ! "$code" =~ ^[A-Z][A-Z]$ ]]; then
+    failed_epoch="$(get_cached_origin_lookup_failed_epoch)"
+    now_epoch="$(date -u '+%s')"
+
+    if [[ "$current_ip" == "$cached_ip" && "$failed_epoch" =~ ^[0-9]+$ && $((now_epoch - failed_epoch)) -lt $failure_cooldown ]]; then
+      return 0
+    fi
+
+    code="$(lookup_origin_country_code)"
+    code="$(printf '%s' "$code" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+
+    if [[ "$code" =~ ^[A-Z][A-Z]$ ]]; then
+      update_origin_cache "$current_ip" "$code" "success"
+    else
+      update_origin_cache "$current_ip" "" "failure"
+      return 0
+    fi
+  fi
+
+  name="${COUNTRY_NAME_BY_CODE[$code]-}"
+  if [[ -n "$name" ]]; then
+    printf '%s - %s' "$code" "$name"
+  else
+    printf '%s - [Unknown]' "$code"
+  fi
 }
 
 # --- options parsing ---
-SHOW_CHART=0
 SAVE_JSON=0
 SHOW_BLOCKED=0
 REFRESH_ISO=0
@@ -234,7 +421,6 @@ ARGS_URLS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -b) SHOW_BLOCKED=1; shift ;;
-    -c) SHOW_CHART=1; shift ;;
     -j) SAVE_JSON=1; shift ;;
     --iso-url)
       shift
@@ -251,12 +437,27 @@ while [[ $# -gt 0 ]]; do
 done
 # append any remaining args after --
 for arg in "$@"; do ARGS_URLS+=("$arg"); done
+
+if (( ${#ARGS_URLS[@]} > 1 )); then
+  printf "%s\n" "Error: only one URL may be supplied." >&2
+  usage >&2
+  exit 2
+fi
+
 set -- "${ARGS_URLS[@]}"
 # --- end options parsing ---
 
-URLS=("$@")
+URL="${1-}"
 
-# Ensure ISO JSON exists (or rebuild/download it), then validate and load maps.
+# Migrate an existing legacy ISO JSON cache into the unified geo cache.
+if [[ ! -f "$JSON_PATH" && -f "$LEGACY_JSON_PATH" ]]; then
+  if ! jq . "$LEGACY_JSON_PATH" | write_country_cache_atomic "$JSON_PATH" "legacy-local-cache" "$LEGACY_JSON_PATH"; then
+    printf "%s\n" "Migration failed from: $LEGACY_JSON_PATH" >&2
+    exit 1
+  fi
+fi
+
+# Ensure geo cache exists (or rebuild/download its country list), then validate and load maps.
 need_iso=0
 if [[ $REFRESH_ISO -eq 1 ]]; then
   need_iso=1
@@ -267,22 +468,30 @@ fi
 if [[ $need_iso -eq 1 ]]; then
   if [[ -n "$ISO_URL" ]]; then
     printf "%s\n\n" "* ISO-3166 JSON refresh requested. Downloading from --iso-url..."
-    if ! curl -fsSL --retry 3 --retry-delay 1 -o "$JSON_PATH" "$ISO_URL"; then
-      printf "%s\n" "Download failed: $ISO_URL" >&2
+    if ! curl -fsSL --retry 3 --retry-delay 1 "$ISO_URL" | write_country_cache_atomic "$JSON_PATH" "manual-iso-url" "$ISO_URL"; then
+      printf "%s\n" "Download or JSON formatting failed: $ISO_URL" >&2
       exit 1
     fi
   else
     printf "%s\n\n" "* ISO-3166 JSON refresh requested. Building from IBAN country table..."
-    if ! build_iso_json_from_iban | write_file_atomic "$JSON_PATH"; then
-      printf "%s\n" "Build failed from: $IBAN_COUNTRY_CODES_URL" >&2
+    if ! build_iso_json_from_iban | write_country_cache_atomic "$JSON_PATH" "iban.com" "$IBAN_COUNTRY_CODES_URL"; then
+      printf "%s\n" "Build or JSON formatting failed from: $IBAN_COUNTRY_CODES_URL" >&2
       exit 1
     fi
   fi
 fi
 
-# Validate JSON
-if ! jq -e . "$JSON_PATH" >/dev/null 2>&1; then
-  printf "%s\n" "Invalid JSON in $JSON_PATH." >&2
+# Validate geo cache JSON and country list
+if ! jq -e '
+  if type == "array" then
+    length > 0
+  elif type == "object" then
+    (.countries | type == "array" and length > 0)
+  else
+    false
+  end
+' "$JSON_PATH" >/dev/null 2>&1; then
+  printf "%s\n" "Invalid geo cache JSON in $JSON_PATH." >&2
   printf "%s\n" "Tip: try --refresh-iso or --iso-url \"$DEFAULT_ISO_URL\"" >&2
   exit 1
 fi
@@ -293,149 +502,149 @@ while IFS=$'\t' read -r code name; do
   [[ -n "$code" ]] || continue
   COUNTRY_NAME_BY_CODE["$code"]="$name"
   ALL_ISO_CODES+="$code"$'\n'
-done < <(jq -r ''' .[] | select(.["alpha-2"] and .name and (.["alpha-2"] | length > 0)) | [.["alpha-2"], .name] | @tsv ''' "$JSON_PATH" | sort -u)
+done < <(jq -r ''' if type == "array" then .[] elif type == "object" then .countries[] else empty end | select(.["alpha-2"] and .name and (.["alpha-2"] | length > 0)) | [.["alpha-2"], .name] | @tsv ''' "$JSON_PATH" | sort -u)
 ISOCODE_COUNT=$(count_nonempty_lines <<<"$ALL_ISO_CODES")
 
-ISOCODE_COUNT=$(count_nonempty_lines <<<"$ALL_ISO_CODES")
-ORIGIN_COUNTRY="$(get_origin_country_suffix)"
+ORIGIN_COUNTRY="$(get_origin_country)"
+if [[ -z "$ORIGIN_COUNTRY" ]]; then
+  ORIGIN_COUNTRY="[Unavailable]"
+fi
 
-for VIDEO_URL in "${URLS[@]}"; do
-  # normalize youtube.com
-  VIDEO_URL="$(printf "%s" "$VIDEO_URL" | sed -E 's#https?://(m\.|music\.|gaming\.|youtube-nocookie\.)?youtube\.com#https://www.youtube.com#')"
-  # normalize youtu.be
-  if [[ "$VIDEO_URL" =~ ^https://youtu\.be/([a-zA-Z0-9_-]+) ]]; then
-    ID="${BASH_REMATCH[1]}"
-    VIDEO_URL="https://www.youtube.com/watch?v=${ID}"
-  else
-    ID="$(printf "%s" "$VIDEO_URL" | sed -E 's#.*v=([^&]+).*#\1#')"
+if [[ -z "$URL" ]]; then
+  exit 0
+fi
+
+VIDEO_URL="$URL"
+# normalize youtube.com
+VIDEO_URL="$(printf "%s" "$VIDEO_URL" | sed -E 's#https?://(m\.|music\.|gaming\.|youtube-nocookie\.)?youtube\.com#https://www.youtube.com#')"
+# normalize youtu.be
+if [[ "$VIDEO_URL" =~ ^https://youtu\.be/([a-zA-Z0-9_-]+) ]]; then
+  ID="${BASH_REMATCH[1]}"
+  VIDEO_URL="https://www.youtube.com/watch?v=${ID}"
+else
+  ID="$(printf "%s" "$VIDEO_URL" | sed -E 's#.*v=([^&]+).*#\1#')"
+fi
+
+JSON="$(curl -fsSL "$VIDEO_URL" | grep -oP 'ytInitialPlayerResponse\s*=\s*\{.*?\};' | sed -e 's/^ytInitialPlayerResponse\s*=\s*//' -e 's/;*$//')"
+if [[ "$SAVE_JSON" -eq 1 ]]; then
+  printf '%s' "$JSON" | jq -S . >"${SCRIPT_DIR}/${SCRIPT_BASE}.${ID}.json"
+fi
+
+# defaults
+STATUS="[error]"
+REASON="Could not extract player response JSON"
+SUBREASON=""
+STATUS_REASON=""
+STATUS_SUBREASON=""
+STATUS_MESSAGES=""
+ALLOWED_CODES=""
+BLOCKED_CODES=""
+ALLOWED_COUNT=0
+BLOCKED_COUNT=0
+HIDDEN=""
+
+if [[ -n "$JSON" ]]; then
+  mapfile -t JSON_FIELDS < <(
+    printf "%s\n" "$JSON" | jq -r '
+      (.playabilityStatus.status // "[null]"),
+      (.playabilityStatus.reason // "[null]"),
+      (.playabilityStatus.errorScreen.playerErrorMessageRenderer.reason.simpleText // "[null]"),
+      (
+        .playabilityStatus.errorScreen.playerErrorMessageRenderer.subreason.simpleText
+        // (.playabilityStatus.errorScreen.playerErrorMessageRenderer.subreason.runs? // [] | map(.text) | join(""))
+        // ""
+      ),
+      (
+        .playabilityStatus.messages?
+        | if type == "array" then map(tostring) | join(" ")
+          elif type == "string" then .
+          else ""
+          end
+      ),
+      (.microformat.playerMicroformatRenderer.isUnlisted // "[null]"),
+      ((.microformat.playerMicroformatRenderer.availableCountries? // []) | unique | length),
+      ((.microformat.playerMicroformatRenderer.availableCountries? // []) | unique[])
+    '
+  )
+
+  STATUS="${JSON_FIELDS[0]:-[null]}"
+  REASON="${JSON_FIELDS[1]:-[null]}"
+  STATUS_REASON="${JSON_FIELDS[2]:-[null]}"
+  STATUS_SUBREASON="${JSON_FIELDS[3]-}"
+  STATUS_MESSAGES="${JSON_FIELDS[4]-}"
+
+  if [[ "$REASON" == "[null]" && "$STATUS_REASON" != "[null]" ]]; then
+    REASON="$STATUS_REASON"
   fi
 
-  JSON="$(curl -fsSL "$VIDEO_URL" | grep -oP 'ytInitialPlayerResponse\s*=\s*\{.*?\};' | sed -e 's/^ytInitialPlayerResponse\s*=\s*//' -e 's/;*$//')"
-  if [[ "$SAVE_JSON" -eq 1 ]]; then
-    printf '%s' "$JSON" | jq -S . >"${SCRIPT_DIR}/${SCRIPT_BASE}.${ID}.json"
+  if [[ "$REASON" == "[null]" && -n "$STATUS_MESSAGES" ]]; then
+    REASON="$STATUS_MESSAGES"
   fi
 
-  # defaults
-  STATUS="[error]"
-  REASON="Could not extract player response JSON"
-  SUBREASON=""
-  STATUS_REASON=""
-  STATUS_SUBREASON=""
-  STATUS_MESSAGES=""
-  ALLOWED_CODES=""
-  BLOCKED_CODES=""
-  ALLOWED_COUNT=0
-  BLOCKED_COUNT=0
-
-  if [[ -n "$JSON" ]]; then
-    mapfile -t JSON_FIELDS < <(
-      printf "%s\n" "$JSON" | jq -r '
-        (.playabilityStatus.status // "[null]"),
-        (.playabilityStatus.reason // "[null]"),
-        (.playabilityStatus.errorScreen.playerErrorMessageRenderer.reason.simpleText // "[null]"),
-        (
-          .playabilityStatus.errorScreen.playerErrorMessageRenderer.subreason.simpleText
-          // (.playabilityStatus.errorScreen.playerErrorMessageRenderer.subreason.runs? // [] | map(.text) | join(""))
-          // ""
-        ),
-        (
-          .playabilityStatus.messages?
-          | if type == "array" then map(tostring) | join(" ")
-            elif type == "string" then .
-            else ""
-            end
-        ),
-        (.microformat.playerMicroformatRenderer.isUnlisted // "[null]"),
-        ((.microformat.playerMicroformatRenderer.availableCountries? // []) | unique | length),
-        ((.microformat.playerMicroformatRenderer.availableCountries? // []) | unique[])
-      '
-    )
-
-    STATUS="${JSON_FIELDS[0]:-[null]}"
-    REASON="${JSON_FIELDS[1]:-[null]}"
-    STATUS_REASON="${JSON_FIELDS[2]:-[null]}"
-    STATUS_SUBREASON="${JSON_FIELDS[3]-}"
-    STATUS_MESSAGES="${JSON_FIELDS[4]-}"
-
-    if [[ "$REASON" == "[null]" && "$STATUS_REASON" != "[null]" ]]; then
-      REASON="$STATUS_REASON"
-    fi
-
-    if [[ "$REASON" == "[null]" && -n "$STATUS_MESSAGES" ]]; then
-      REASON="$STATUS_MESSAGES"
-    fi
-
-    SUBREASON="$STATUS_SUBREASON"
-    if [[ -n "$SUBREASON" && "$SUBREASON" != "[null]" ]]; then
-      if [[ "$REASON" == "[null]" ]]; then
-        REASON="$SUBREASON"
-      else
-        REASON="${REASON} - ${SUBREASON}"
-      fi
-    fi
-
-    ALLOWED_COUNT="${JSON_FIELDS[6]:-0}"
-    ALLOWED_CODES=""
-    if (( ${#JSON_FIELDS[@]} > 7 )); then
-      ALLOWED_CODES="$(printf '%s\n' "${JSON_FIELDS[@]:7}")"
-    fi
-
-    HIDDEN="${JSON_FIELDS[5]:-[null]}"
-    if [[ "$HIDDEN" == "true" ]]; then
-      HIDDEN="(hidden)"
+  SUBREASON="$STATUS_SUBREASON"
+  if [[ -n "$SUBREASON" && "$SUBREASON" != "[null]" ]]; then
+    if [[ "$REASON" == "[null]" ]]; then
+      REASON="$SUBREASON"
     else
-      HIDDEN=""
-    fi
-
-    if [[ "$SHOW_BLOCKED" -eq 1 ]]; then
-      BLOCKED_CODES="$(comm -23         <(printf '%s\n' "$ALL_ISO_CODES" | LC_ALL=C sort -u)         <(printf '%s\n' "$ALLOWED_CODES" | LC_ALL=C sort -u)
-      )"
-      BLOCKED_COUNT=$((ISOCODE_COUNT - ALLOWED_COUNT))
-    elif [[ "$SHOW_CHART" -eq 1 || ${#URLS[@]} -gt 1 ]]; then
-      BLOCKED_COUNT=$((ISOCODE_COUNT - ALLOWED_COUNT))
+      REASON="${REASON} - ${SUBREASON}"
     fi
   fi
 
-  if [[ "$SHOW_CHART" -eq 1 || ${#URLS[@]} -gt 1 ]]; then
-    printf "| Video ID    | Status | Allowed(#)  | Blocked(#) | Reason |\n"
-    printf "|-------------|--------|------------:|-----------:|--------|\n"
-    printf "| %s          | %s     |          %s |         %s | %s         |\n" "$ID" "$STATUS" "$ALLOWED_COUNT" "$BLOCKED_COUNT" "$REASON"
+  ALLOWED_COUNT="${JSON_FIELDS[6]:-0}"
+  ALLOWED_CODES=""
+  if (( ${#JSON_FIELDS[@]} > 7 )); then
+    ALLOWED_CODES="$(printf '%s\n' "${JSON_FIELDS[@]:7}")"
+  fi
+
+  HIDDEN="${JSON_FIELDS[5]:-[null]}"
+  if [[ "$HIDDEN" == "true" ]]; then
+    HIDDEN="(hidden)"
+  else
+    HIDDEN=""
+  fi
+
+  if [[ "$SHOW_BLOCKED" -eq 1 ]]; then
+    BLOCKED_CODES="$(comm -23 <(printf '%s\n' "$ALL_ISO_CODES" | LC_ALL=C sort -u) <(printf '%s\n' "$ALLOWED_CODES" | LC_ALL=C sort -u)
+    )"
+    BLOCKED_COUNT=$((ISOCODE_COUNT - ALLOWED_COUNT))
+  fi
+fi
+
+print_wrap 7 2        "URL:" "$VIDEO_URL"
+print_wrap 7 2     "LOCALE:" "$ORIGIN_COUNTRY ${HIDDEN:+ $HIDDEN}"
+print_wrap 7 2     "STATUS:" "$STATUS ${HIDDEN:+ $HIDDEN}"
+print_wrap 7 2     "REASON:" "$REASON"
+
+if [[ $STATUS == LOGIN_REQUIRED ]]; then
+  print_wrap 7 2   "ACCESS:" "Unknown - authentication required to verify access"
+elif [[ $STATUS == ERROR ]]; then
+  if ((${ALLOWED_COUNT:-0} > 0)); then
+    print_wrap 7 2 "ACCESS:" "Limited - $ALLOWED_COUNT of $ISOCODE_COUNT country codes"
+  else
+    print_wrap 7 2 "ACCESS:" "Unavailable - no country access is listed"
+  fi
+elif [[ $STATUS == UNPLAYABLE ]]; then
+  if ((${ALLOWED_COUNT:-0} > 0)); then
+    print_wrap 7 2 "ACCESS:" "Limited - $ALLOWED_COUNT of $ISOCODE_COUNT country codes"
+  else
+    print_wrap 7 2 "ACCESS:" "Nowhere - no country access is allowed"
+  fi
+elif [[ $STATUS == OK ]]; then
+  if ((ALLOWED_COUNT == ISOCODE_COUNT && ISOCODE_COUNT > 0)); then
+    print_wrap 7 2 "ACCESS:" "Everywhere - all countries explicitly specified"
+  elif ((${ALLOWED_COUNT:-0} < 1)); then
+    print_wrap 7 2 "ACCESS:" "Everywhere - no countries explicitly specified"
+  elif ((${ALLOWED_COUNT:-0} < ${ISOCODE_COUNT:-0})); then
+    print_wrap 7 2 "ACCESS:" "Limited - $ALLOWED_COUNT of $ISOCODE_COUNT country codes"
+  fi
+fi
+
+if [[ $STATUS != LOGIN_REQUIRED && $STATUS != ERROR ]]; then
+  printf "\n"
+  translate_codes "$ALLOWED_CODES" "Allowed Countries ($ALLOWED_COUNT of $ISOCODE_COUNT):"
+
+  if [[ "$SHOW_BLOCKED" -eq 1 ]]; then
     printf "\n"
+    translate_codes "$BLOCKED_CODES" "Blocked Countries ($BLOCKED_COUNT of $ISOCODE_COUNT), inferred from ISO-3166:"
   fi
-
-  if [[ ${#URLS[@]} -eq 1 ]]; then
-    printf "%12s: %s\n" "URL" "$VIDEO_URL"
-#   printf "%12s: %s %s\n" "STATUS" "$STATUS" "$HIDDEN"
-    printf "%12s: %s%s%s\n" "STATUS" "$STATUS" "$ORIGIN_COUNTRY" "${HIDDEN:+ $HIDDEN}"
-
-    if [[ $STATUS == LOGIN_REQUIRED ]]; then
-      printf "%12s: %s\n" "AVAILABILITY" "Unknown (authentication required to verify access)"
-    elif [[ $STATUS == UNPLAYABLE ]]; then
-      if ((${ALLOWED_COUNT:-0} > 0)); then
-        printf "%12s: %s\n" "AVAILABILITY" "Limited ($ALLOWED_COUNT of $ISOCODE_COUNT country codes)"
-      else
-        printf "%12s: %s\n" "AVAILABILITY" "Nowhere (no access is allowed)"
-      fi
-    elif [[ $STATUS == OK ]]; then
-      if ((ALLOWED_COUNT == ISOCODE_COUNT && ISOCODE_COUNT > 0)); then
-        printf "%12s: %s\n" "AVAILABILITY" "Everywhere (all countries explicitly specified)"
-      elif ((${ALLOWED_COUNT:-0} < 1)); then
-        printf "%12s: %s\n" "AVAILABILITY" "Everywhere (no countries explicitly specified)"
-      elif ((${ALLOWED_COUNT:-0} < ${ISOCODE_COUNT:-0})); then
-        printf "%12s: %s\n" "AVAILABILITY" "Limited ($ALLOWED_COUNT of $ISOCODE_COUNT country codes)"
-      fi
-    fi
-
-    printf "%12s: %s\n" "REASON" "$REASON"
-  fi
-
-  if [[ $STATUS != LOGIN_REQUIRED ]]; then
-    printf "\n"
-    translate_codes "$ALLOWED_CODES" "Allowed Countries ($ALLOWED_COUNT of $ISOCODE_COUNT):"
-
-    if [[ "$SHOW_BLOCKED" -eq 1 ]]; then
-      printf "\n"
-      translate_codes "$BLOCKED_CODES" "Blocked Countries ($BLOCKED_COUNT of $ISOCODE_COUNT), inferred from ISO-3166:"
-    fi
-  fi
-done
+fi
