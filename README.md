@@ -3,7 +3,7 @@ It should work without issues
 # Example output
 
 ```
-# bash /volume1/homes/admin/scripts/bash/checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"
+# bash checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"
    URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
 LOCALE: US - United States of America (the)
 STATUS: OK
