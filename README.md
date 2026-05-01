@@ -1,14 +1,31 @@
 It should work without issues
 
-# Example output
+### Usage
 
 ```
-# bash checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"
+Usage: checkForYoutubeGeoRestriction.sh [options] [URL]
+
+Options:
+  -b               Show only inferred blocked countries per ISO-3166
+  -f AA,BB,CC,...  Show only specific country codes that are allowed
+  -j               Save Youtube JSON response
+  --iso-url URL    Download ISO-3166 JSON from URL (manual shim)
+  --refresh-iso    Force rebuild/download of geo cache country list from IBAN
+  -h, --help       Show this help
+```
+
+### Utilization and example output
+
+```
+# bash /volume1/homes/admin/scripts/bash/checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"                                             
+CHECK FOR YOUTUBE GEORESTRICTION v2.0.0
+
    URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
 LOCALE: US - United States of America (the)
 STATUS: OK
 REASON: [null]
 ACCESS: Everywhere - all countries explicitly specified
+FILTER: Allowed countries reported by YouTube
 
 Allowed Countries (249 of 249):
 
