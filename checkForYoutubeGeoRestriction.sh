@@ -1,7 +1,7 @@
 #!/bin/bash
 # A script to automagically check for YouTube geo-restrictions.
 # Author @michealespinola https://github.com/michealespinola/checkForYoutubeGeoRestriction
-# shellcheck disable=SC1112
+# shellcheck disable=SC1112,SC2034
 # shellcheck source=/dev/null
 #
 # Usage examples:
@@ -10,27 +10,39 @@
 #   bash ./checkForYoutubeGeoRestriction.sh --iso-url "https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/slim-2/slim-2.json"
 #   bash ./checkForYoutubeGeoRestriction.sh --refresh-iso
 
+SCRIPT_VERSION=2.0.0
+
 set -euo pipefail
 IFS=$'\n\t'
 
-# Default manual ISO JSON URL (used only if --iso-url is provided)
-DEFAULT_ISO_URL="https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/slim-2/slim-2.json"
+get_source_info() {                                                                               # FUNCTION TO GET SOURCE SCRIPT INFORMATION
+  srcScrpVer=${SCRIPT_VERSION}                                                                    # Source script version
+  srcFullPth=$(readlink -f "${BASH_SOURCE[0]}")                                                   # Source script absolute path of script
+  srcDirctry=$(dirname "$srcFullPth")                                                             # Source script directory containing script
+  srcFileNam=${srcFullPth##*/}                                                                    # Source script script file name
+}
+get_source_info
+
+printf "\n%s\n\n" "CHECK FOR YOUTUBE GEORESTRICTION v$srcScrpVer"                                # Print our glorious header because we are full of ourselves
 
 # Default scrape source (used when generating ISO JSON without --iso-url)
 IBAN_COUNTRY_CODES_URL="https://www.iban.com/country-codes"
+
+# Default manual ISO JSON URL (used only if --iso-url is provided)
+DEFAULT_ISO_URL="https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/slim-2/slim-2.json"
 
 JSON_NAME="geo-cache.json"
 LEGACY_JSON_NAME="iso-3166-1-slim-2.json"
 
 usage() {
-  printf "%s\n" "Usage: $0 [options] [\"https://www.youtube.com/watch?v=...\"]"
-  printf "%s\n" ""
-  printf "%s\n" "Options:"
-  printf "%s\n" "  -b                 Show inferred blocked countries"
-  printf "%s\n" "  -j                 Save extracted ytInitialPlayerResponse JSON"
-  printf "%s\n" "  --iso-url URL      Download ISO JSON from URL (shim for manual source)"
-  printf "%s\n" "  --refresh-iso      Force rebuild/download of geo cache country list"
-  printf "%s\n" "  -h, --help         Show this help"
+  printf "%s\n\n" "Usage: $srcFileNam [options] [URL]"
+  printf "%s\n"   "Options:"
+  print_wrap 18 2  "  -b              " "Show only inferred blocked countries per ISO-3166"
+  print_wrap 18 2  "  -f AA,BB,CC,... " "Show only specific country codes that are allowed"
+  print_wrap 18 2  "  -j              " "Save Youtube JSON response"
+  print_wrap 18 2  "  --iso-url URL   " "Download ISO-3166 JSON from URL (manual shim)"
+  print_wrap 18 2  "  --refresh-iso   " "Force rebuild/download of geo cache country list from IBAN"
+  print_wrap 18 2  "  -h, --help      " "Show this help"
 }
 
 get_term_cols() {                                                                                 # FUNCTION TO GET TERMINAL COLUMN WIDTH
@@ -105,6 +117,54 @@ translate_codes() {
   done <<<"$input"
 }
 
+normalize_country_code_list() {
+  local input="$1"
+
+  printf '%s\n' "$input" |
+    tr ',' '\n' |
+    tr '[:lower:]' '[:upper:]' |
+    sed 's/^[[:space:]]*//;s/[[:space:]]*$//' |
+    awk '
+      /^[A-Z][A-Z]$/ {
+        if (!seen[$0]++) {
+          print
+        }
+        next
+      }
+
+      NF {
+        bad=1
+      }
+
+      END {
+        exit bad
+      }
+    ' |
+    LC_ALL=C sort -u
+}
+
+validate_country_codes_known() {
+  local input="$1"
+  local unknown_codes=""
+
+  unknown_codes="$(
+    comm -23 \
+      <(printf '%s\n' "$input" | LC_ALL=C sort -u) \
+      <(printf '%s\n' "$ALL_ISO_CODES" | LC_ALL=C sort -u)
+  )"
+
+  if [[ -n "$unknown_codes" ]]; then
+    printf "%s\n" "Error: Unsupported ISO-3166 country code supplied to -f:" >&2
+
+    while IFS= read -r code; do
+      [[ -n "$code" ]] || continue
+      printf "  %s\n" "$code" >&2
+    done <<<"$unknown_codes"
+
+    return 1
+  fi
+}
+
 # Count non-empty lines from stdin, robust to missing trailing newline and CRLF
 count_nonempty_lines() {
   local line n=0
@@ -114,6 +174,19 @@ count_nonempty_lines() {
     ((n++))
   done
   printf '%d\n' "$n"
+}
+
+join_lines_csv() {
+  awk '
+    NF {
+      printf "%s%s", sep, $0
+      sep=","
+    }
+
+    END {
+      printf "\n"
+    }
+  ' <<<"$1"
 }
 
 # check required tools
@@ -415,12 +488,26 @@ get_origin_country() {
 SAVE_JSON=0
 SHOW_BLOCKED=0
 REFRESH_ISO=0
+FILTER=0
+FILTER_CODES=""
+FILTER_COUNT=0
 ISO_URL=""
 
 ARGS_URLS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -b) SHOW_BLOCKED=1; shift ;;
+    -f|--filter)
+      shift
+      [[ $# -gt 0 ]] || { printf "%s\n" "Error: -f requires a comma-separated country code list" >&2; exit 2; }
+      FILTER=1
+      if ! FILTER_CODES="$(normalize_country_code_list "$1")" || [[ -z "$FILTER_CODES" ]]; then
+        printf "%s\n" "Error: -f requires comma-separated ISO-3166 alpha-2 country codes, for example: -f GB,IE,NO" >&2
+        exit 2
+      fi
+      FILTER_COUNT="$(count_nonempty_lines <<<"$FILTER_CODES")"
+      shift
+      ;;
     -j) SAVE_JSON=1; shift ;;
     --iso-url)
       shift
@@ -446,6 +533,11 @@ fi
 
 set -- "${ARGS_URLS[@]}"
 # --- end options parsing ---
+
+if [[ "$SHOW_BLOCKED" -eq 1 && "$FILTER" -eq 1 ]]; then
+  printf "%s\n" "Error: -b and -f are mutually exclusive display options." >&2
+  exit 2
+fi
 
 URL="${1-}"
 
@@ -505,6 +597,10 @@ while IFS=$'\t' read -r code name; do
 done < <(jq -r ''' if type == "array" then .[] elif type == "object" then .countries[] else empty end | select(.["alpha-2"] and .name and (.["alpha-2"] | length > 0)) | [.["alpha-2"], .name] | @tsv ''' "$JSON_PATH" | sort -u)
 ISOCODE_COUNT=$(count_nonempty_lines <<<"$ALL_ISO_CODES")
 
+if [[ "$FILTER" -eq 1 ]]; then
+  validate_country_codes_known "$FILTER_CODES" || exit 2
+fi
+
 ORIGIN_COUNTRY="$(get_origin_country)"
 if [[ -z "$ORIGIN_COUNTRY" ]]; then
   ORIGIN_COUNTRY="[Unavailable]"
@@ -539,9 +635,12 @@ STATUS_SUBREASON=""
 STATUS_MESSAGES=""
 ALLOWED_CODES=""
 BLOCKED_CODES=""
+FILTER_ALLOWED_CODES=""
 ALLOWED_COUNT=0
 BLOCKED_COUNT=0
+FILTER_ALLOWED_COUNT=0
 HIDDEN=""
+FILTER_TEXT=""
 
 if [[ -n "$JSON" ]]; then
   mapfile -t JSON_FIELDS < <(
@@ -610,13 +709,33 @@ if [[ -n "$JSON" ]]; then
   fi
 fi
 
-print_wrap 7 2        "URL:" "$VIDEO_URL"
-print_wrap 7 2     "LOCALE:" "$ORIGIN_COUNTRY ${HIDDEN:+ $HIDDEN}"
-print_wrap 7 2     "STATUS:" "$STATUS ${HIDDEN:+ $HIDDEN}"
-print_wrap 7 2     "REASON:" "$REASON"
+if [[ "$FILTER" -eq 1 ]]; then
+  if (( ${ALLOWED_COUNT:-0} > 0 )); then
+    FILTER_ALLOWED_CODES="$(
+      comm -12 \
+        <(printf '%s\n' "$FILTER_CODES" | LC_ALL=C sort -u) \
+        <(printf '%s\n' "$ALLOWED_CODES" | LC_ALL=C sort -u)
+    )"
+  fi
+
+  FILTER_ALLOWED_COUNT="$(count_nonempty_lines <<<"$FILTER_ALLOWED_CODES")"
+fi
+
+if [[ "$FILTER" -eq 1 ]]; then
+  FILTER_TEXT="Allowed country codes $(join_lines_csv "$FILTER_CODES")"
+elif [[ "$SHOW_BLOCKED" -eq 1 ]]; then
+  FILTER_TEXT="Blocked countries inferred from ISO-3166"
+else
+  FILTER_TEXT="Allowed countries reported by YouTube"
+fi
+
+print_wrap     7 2    "URL:" "$VIDEO_URL"
+print_wrap     7 2 "LOCALE:" "$ORIGIN_COUNTRY ${HIDDEN:+ $HIDDEN}"
+print_wrap     7 2 "STATUS:" "$STATUS ${HIDDEN:+ $HIDDEN}"
+print_wrap     7 2 "REASON:" "$REASON"
 
 if [[ $STATUS == LOGIN_REQUIRED ]]; then
-  print_wrap 7 2   "ACCESS:" "Unknown - authentication required to verify access"
+  print_wrap   7 2 "ACCESS:" "Unknown - authentication required to verify access"
 elif [[ $STATUS == ERROR ]]; then
   if ((${ALLOWED_COUNT:-0} > 0)); then
     print_wrap 7 2 "ACCESS:" "Limited - $ALLOWED_COUNT of $ISOCODE_COUNT country codes"
@@ -638,13 +757,16 @@ elif [[ $STATUS == OK ]]; then
     print_wrap 7 2 "ACCESS:" "Limited - $ALLOWED_COUNT of $ISOCODE_COUNT country codes"
   fi
 fi
+print_wrap     7 2 "FILTER:" "$FILTER_TEXT"
 
 if [[ $STATUS != LOGIN_REQUIRED && $STATUS != ERROR ]]; then
   printf "\n"
-  translate_codes "$ALLOWED_CODES" "Allowed Countries ($ALLOWED_COUNT of $ISOCODE_COUNT):"
 
-  if [[ "$SHOW_BLOCKED" -eq 1 ]]; then
-    printf "\n"
+  if [[ "$FILTER" -eq 1 ]]; then
+    translate_codes "$FILTER_ALLOWED_CODES" "Filtered Allowed Countries ($FILTER_ALLOWED_COUNT of $FILTER_COUNT requested):"
+  elif [[ "$SHOW_BLOCKED" -eq 1 ]]; then
     translate_codes "$BLOCKED_CODES" "Blocked Countries ($BLOCKED_COUNT of $ISOCODE_COUNT), inferred from ISO-3166:"
+  else
+    translate_codes "$ALLOWED_CODES" "Allowed Countries ($ALLOWED_COUNT of $ISOCODE_COUNT):"
   fi
 fi
