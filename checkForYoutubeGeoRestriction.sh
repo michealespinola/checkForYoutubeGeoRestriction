@@ -10,7 +10,7 @@
 #   bash ./checkForYoutubeGeoRestriction.sh --iso-url "https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/slim-2/slim-2.json"
 #   bash ./checkForYoutubeGeoRestriction.sh --refresh-iso
 
-SCRIPT_VERSION=2.0.0
+SCRIPT_VERSION=2.1.0
 
 set -euo pipefail
 IFS=$'\n\t'
@@ -22,8 +22,6 @@ get_source_info() {                                                             
   srcFileNam=${srcFullPth##*/}                                                                    # Source script script file name
 }
 get_source_info
-
-printf "\n%s\n\n" "CHECK FOR YOUTUBE GEORESTRICTION v$srcScrpVer"                                # Print our glorious header because we are full of ourselves
 
 # Default scrape source (used when generating ISO JSON without --iso-url)
 IBAN_COUNTRY_CODES_URL="https://www.iban.com/country-codes"
@@ -40,6 +38,7 @@ usage() {
   print_wrap 18 2  "  -b              " "Show only inferred blocked countries per ISO-3166"
   print_wrap 18 2  "  -f AA,BB,CC,... " "Show only specific country codes that are allowed"
   print_wrap 18 2  "  -j              " "Save Youtube JSON response"
+  print_wrap 18 2  "  -q              " "Quiet output; print only comma-separated country codes"
   print_wrap 18 2  "  --iso-url URL   " "Download ISO-3166 JSON from URL (manual shim)"
   print_wrap 18 2  "  --refresh-iso   " "Force rebuild/download of geo cache country list from IBAN"
   print_wrap 18 2  "  -h, --help      " "Show this help"
@@ -489,6 +488,7 @@ SAVE_JSON=0
 SHOW_BLOCKED=0
 REFRESH_ISO=0
 FILTER=0
+QUIET=0
 FILTER_CODES=""
 FILTER_COUNT=0
 ISO_URL=""
@@ -509,6 +509,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     -j) SAVE_JSON=1; shift ;;
+    -q) QUIET=1; shift ;;
     --iso-url)
       shift
       [[ $# -gt 0 ]] || { printf "%s\n" "Error: --iso-url requires a URL argument" >&2; exit 2; }
@@ -537,6 +538,10 @@ set -- "${ARGS_URLS[@]}"
 if [[ "$SHOW_BLOCKED" -eq 1 && "$FILTER" -eq 1 ]]; then
   printf "%s\n" "Error: -b and -f are mutually exclusive display options." >&2
   exit 2
+fi
+
+if [[ "$QUIET" -eq 0 ]]; then
+  printf "\n%s\n\n" "CHECK FOR YOUTUBE GEORESTRICTION v$srcScrpVer"
 fi
 
 URL="${1-}"
@@ -727,6 +732,18 @@ elif [[ "$SHOW_BLOCKED" -eq 1 ]]; then
   FILTER_TEXT="Blocked countries inferred from ISO-3166"
 else
   FILTER_TEXT="Allowed countries reported by YouTube"
+fi
+
+if [[ "$QUIET" -eq 1 ]]; then
+  if [[ "$FILTER" -eq 1 ]]; then
+    join_lines_csv "$FILTER_ALLOWED_CODES"
+  elif [[ "$SHOW_BLOCKED" -eq 1 ]]; then
+    join_lines_csv "$BLOCKED_CODES"
+  else
+    join_lines_csv "$ALLOWED_CODES"
+  fi
+
+  exit 0
 fi
 
 print_wrap     7 2    "URL:" "$VIDEO_URL"
