@@ -9,6 +9,7 @@ Options:
   -b               Show only inferred blocked countries per ISO-3166
   -f AA,BB,CC,...  Show only specific country codes that are allowed
   -j               Save Youtube JSON response
+  -q               Quiet output; print only comma-separated country codes
   --iso-url URL    Download ISO-3166 JSON from URL (manual shim)
   --refresh-iso    Force rebuild/download of geo cache country list from IBAN
   -h, --help       Show this help
