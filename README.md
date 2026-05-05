@@ -11,7 +11,8 @@ Options:
   -j               Save Youtube JSON response
   -q               Quiet output; print only comma-separated country codes
   --iso-url URL    Download ISO-3166 JSON from URL (manual shim)
-  --refresh-iso    Force rebuild/download of geo cache country list from IBAN
+  --refresh-iso    Force rebuild/download of geo cache country list from Debian
+                   iso-codes, with IBAN fallback
   -h, --help       Show this help
 ```
 
@@ -20,7 +21,7 @@ Options:
 ```
 # bash checkForYoutubeGeoRestriction.sh "https://youtu.be/dQw4w9WgXcQ"
                                           
-CHECK FOR YOUTUBE GEORESTRICTION v2.0.0
+CHECK FOR YOUTUBE GEORESTRICTION v2.2.0
 
    URL: https://www.youtube.com/watch?v=dQw4w9WgXcQ
 LOCALE: US - United States of America (the)
