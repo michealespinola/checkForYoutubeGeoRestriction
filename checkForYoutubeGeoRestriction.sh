@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # A script to automagically check for YouTube geo-restrictions.
 # Author @michealespinola https://github.com/michealespinola/checkForYoutubeGeoRestriction
 # shellcheck disable=SC1112,SC2034
@@ -10,27 +10,29 @@
 #   bash ./checkForYoutubeGeoRestriction.sh --iso-url "https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/slim-2/slim-2.json"
 #   bash ./checkForYoutubeGeoRestriction.sh --refresh-iso
 
-SCRIPT_VERSION=2.1.0
+SCRIPT_VERSION=2.2.0
 
 set -euo pipefail
 IFS=$'\n\t'
 
 get_source_info() {                                                                               # FUNCTION TO GET SOURCE SCRIPT INFORMATION
-  srcScrpVer=${SCRIPT_VERSION}                                                                    # Source script version
-  srcFullPth=$(readlink -f "${BASH_SOURCE[0]}")                                                   # Source script absolute path of script
-  srcDirctry=$(dirname "$srcFullPth")                                                             # Source script directory containing script
-  srcFileNam=${srcFullPth##*/}                                                                    # Source script script file name
+  srcScrpVer="${SCRIPT_VERSION}"                                                                  # Source script version
+  srcFullDir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"                             # Source script absolute physical directory
+  srcFullPth="${srcFullDir}/$(basename -- "${BASH_SOURCE[0]}")"                                   # Source script absolute path
+  srcFileNam="${srcFullPth##*/}"                                                                  # Source script file name
 }
 get_source_info
 
-# Default scrape source (used when generating ISO JSON without --iso-url)
+# Primary ISO country-code JSON source
+DEBIAN_ISO_CODES_URL="https://salsa.debian.org/iso-codes-team/iso-codes/-/raw/main/data/iso_3166-1.json"
+
+# Fallback scrape source
 IBAN_COUNTRY_CODES_URL="https://www.iban.com/country-codes"
 
-# Default manual ISO JSON URL (used only if --iso-url is provided)
-DEFAULT_ISO_URL="https://raw.githubusercontent.com/lukes/ISO-3166-Countries-with-Regional-Codes/master/slim-2/slim-2.json"
+# Default manual ISO JSON URL shown in error tips
+DEFAULT_ISO_URL="$DEBIAN_ISO_CODES_URL"
 
 JSON_NAME="geo-cache.json"
-LEGACY_JSON_NAME="iso-3166-1-slim-2.json"
 
 usage() {
   printf "%s\n\n" "Usage: $srcFileNam [options] [URL]"
@@ -40,7 +42,7 @@ usage() {
   print_wrap 18 2  "  -j              " "Save Youtube JSON response"
   print_wrap 18 2  "  -q              " "Quiet output; print only comma-separated country codes"
   print_wrap 18 2  "  --iso-url URL   " "Download ISO-3166 JSON from URL (manual shim)"
-  print_wrap 18 2  "  --refresh-iso   " "Force rebuild/download of geo cache country list from IBAN"
+  print_wrap 18 2  "  --refresh-iso   " "Force rebuild/download of geo cache country list from Debian iso-codes, with IBAN fallback"
   print_wrap 18 2  "  -h, --help      " "Show this help"
 }
 
@@ -87,7 +89,6 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 SCRIPT_BASE="$(basename -- "${BASH_SOURCE[0]%.*}")"
 JSON_PATH="${SCRIPT_DIR}/${JSON_NAME}"
-LEGACY_JSON_PATH="${SCRIPT_DIR}/${LEGACY_JSON_NAME}"
 
 # Translate ISO country codes to names using COUNTRY_MAP
 translate_codes() {
@@ -299,6 +300,69 @@ build_iso_json_from_iban() {
     '
 }
 
+validate_iso_country_json() {
+  local json=""
+  local valid_count=""
+
+  json="$(cat)"
+
+  if [[ -z "${json//[[:space:]]/}" ]]; then
+    printf "%s\n" "Error: ISO country list is empty." >&2
+    return 1
+  fi
+
+  if ! valid_count="$(
+    jq -r '
+      if type == "array" then
+        [.[] | select(.["alpha-2"] and (.["alpha-2"] | test("^[A-Z]{2}$")))]
+      elif type == "object" and (.countries | type == "array") then
+        [.countries[] | select(.["alpha-2"] and (.["alpha-2"] | test("^[A-Z]{2}$")))]
+      else
+        []
+      end
+      | length
+    ' <<<"$json" 2>/dev/null
+  )"; then
+    printf "%s\n" "Error: ISO country list is not valid JSON." >&2
+    return 1
+  fi
+
+  if [[ ! "$valid_count" =~ ^[0-9]+$ || "$valid_count" -lt 1 ]]; then
+    printf "%s\n" "Error: ISO country list does not contain usable alpha-2 country codes." >&2
+    return 1
+  fi
+
+  printf '%s\n' "$json"
+}
+
+# Build ISO JSON from Debian iso-codes.
+# Input schema:
+#   {"3166-1":[{"alpha_2":"AF","alpha_3":"AFG","name":"Afghanistan","numeric":"004"}, ...]}
+# Output schema matches the slim format used by this script:
+#   [{"name":"Afghanistan","alpha-2":"AF","country-code":"004"}, ...]
+build_iso_json_from_debian_iso_codes() {
+  curl -fsSL --retry 3 --retry-delay 1 "$DEBIAN_ISO_CODES_URL" |
+    jq -c '
+      if type == "object" and (.["3166-1"] | type == "array") then
+        .["3166-1"]
+      else
+        error("expected Debian iso-codes object with 3166-1 array")
+      end
+      | map(
+          select(.alpha_2 and .name and .numeric)
+          | select(.alpha_2 | test("^[A-Z]{2}$"))
+          | {
+              name: (.common_name // .name),
+              "alpha-2": .alpha_2,
+              "country-code": .numeric
+            }
+        )
+      | unique_by(."alpha-2")
+      | sort_by(."alpha-2")
+    '
+}
+
+# Write ISO country data into the unified geo cache, preserving existing origin data.
 # Write ISO country data into the unified geo cache, preserving existing origin data.
 write_country_cache_atomic() {
   local dest="$1"
@@ -308,15 +372,35 @@ write_country_cache_atomic() {
   local origin="{}"
   local checked_at=""
   local checked_epoch=""
+  local json=""
+
+  json="$(cat)"
+
+  if [[ -z "${json//[[:space:]]/}" ]]; then
+    printf "%s\n" "Error: no ISO country JSON was provided to cache writer." >&2
+    return 1
+  fi
 
   checked_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   checked_epoch="$(date -u '+%s')"
 
-  if [[ -f "$dest" ]]; then
-    origin="$(jq -c 'if type == "object" then (.origin // {}) else {} end' "$dest" 2>/dev/null || printf '{}')"
+  if [[ -s "$dest" ]]; then
+    origin="$(
+      jq -c '
+        if type == "object" and (.origin | type == "object") then
+          .origin
+        else
+          {}
+        end
+      ' "$dest" 2>/dev/null || printf '{}'
+    )"
   fi
 
-  if jq \
+  if ! jq -e 'type == "object"' >/dev/null 2>&1 <<<"$origin"; then
+    origin="{}"
+  fi
+
+  if jq -e \
     --arg checked_at "$checked_at" \
     --arg checked_epoch "$checked_epoch" \
     --arg provider "$provider" \
@@ -343,13 +427,14 @@ write_country_cache_atomic() {
           },
           countries: $countries
         }
-    ' >"$tmp"; then
+    ' <<<"$json" >"$tmp"; then
     mv -f -- "$tmp" "$dest"
   else
     rm -f -- "$tmp"
     return 1
   fi
 }
+
 get_cached_origin_ip() {
   jq -r 'if type == "object" then (.origin.external_ip // "") else "" end' "$JSON_PATH" 2>/dev/null
 }
@@ -546,14 +631,6 @@ fi
 
 URL="${1-}"
 
-# Migrate an existing legacy ISO JSON cache into the unified geo cache.
-if [[ ! -f "$JSON_PATH" && -f "$LEGACY_JSON_PATH" ]]; then
-  if ! jq . "$LEGACY_JSON_PATH" | write_country_cache_atomic "$JSON_PATH" "legacy-local-cache" "$LEGACY_JSON_PATH"; then
-    printf "%s\n" "Migration failed from: $LEGACY_JSON_PATH" >&2
-    exit 1
-  fi
-fi
-
 # Ensure geo cache exists (or rebuild/download its country list), then validate and load maps.
 need_iso=0
 if [[ $REFRESH_ISO -eq 1 ]]; then
@@ -565,15 +642,26 @@ fi
 if [[ $need_iso -eq 1 ]]; then
   if [[ -n "$ISO_URL" ]]; then
     printf "%s\n\n" "* ISO-3166 JSON refresh requested. Downloading from --iso-url..."
-    if ! curl -fsSL --retry 3 --retry-delay 1 "$ISO_URL" | write_country_cache_atomic "$JSON_PATH" "manual-iso-url" "$ISO_URL"; then
+    if ! curl -fsSL --retry 3 --retry-delay 1 "$ISO_URL" |
+      validate_iso_country_json |
+      write_country_cache_atomic "$JSON_PATH" "manual-iso-url" "$ISO_URL"; then
       printf "%s\n" "Download or JSON formatting failed: $ISO_URL" >&2
       exit 1
     fi
   else
-    printf "%s\n\n" "* ISO-3166 JSON refresh requested. Building from IBAN country table..."
-    if ! build_iso_json_from_iban | write_country_cache_atomic "$JSON_PATH" "iban.com" "$IBAN_COUNTRY_CODES_URL"; then
-      printf "%s\n" "Build or JSON formatting failed from: $IBAN_COUNTRY_CODES_URL" >&2
-      exit 1
+    printf "%s\n\n" "* ISO-3166 JSON refresh requested. Downloading from Debian iso-codes..."
+
+    if build_iso_json_from_debian_iso_codes | validate_iso_country_json | write_country_cache_atomic "$JSON_PATH" "debian-iso-codes" "$DEBIAN_ISO_CODES_URL"; then
+      :
+    else
+      printf "%s\n\n" "* Debian iso-codes refresh failed. Falling back to IBAN country table..." >&2
+
+      if ! build_iso_json_from_iban | validate_iso_country_json | write_country_cache_atomic "$JSON_PATH" "iban.com" "$IBAN_COUNTRY_CODES_URL"; then
+        printf "%s\n" "Build or JSON formatting failed from both sources." >&2
+        printf "%s\n" "Primary:  $DEBIAN_ISO_CODES_URL" >&2
+        printf "%s\n" "Fallback: $IBAN_COUNTRY_CODES_URL" >&2
+        exit 1
+      fi
     fi
   fi
 fi
